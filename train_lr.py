@@ -12,7 +12,7 @@
 import os
 import torch
 from random import randint
-from utils.loss_utils import ssim, weighted_ssim
+from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -22,15 +22,11 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
-from torchvision.utils import save_image
-import numpy as np
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
-TENSORBOARD_FOUND = False
-from PIL import Image
 
 try:
     from fused_ssim import fused_ssim
@@ -45,8 +41,6 @@ except:
     SPARSE_ADAM_AVAILABLE = False
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
-    background = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
-    dataset.img_ext = opt.img_ext
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
@@ -55,17 +49,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
-    if args.render_debug:
-        os.makedirs(os.path.join(scene.model_path, 'renders'), exist_ok=True)
     gaussians.training_setup(opt)
-    # Load LR images
-    for cam in scene.getTrainCameras():
-        H, W = cam.image_height, cam.image_width
-        h_lr, w_lr = round(H/opt.upscale), round(W/opt.upscale)
-        lr_image = Image.open(f"{dataset.source_path}/images/" + cam.image_name.replace('.png', '.jpg')).resize((w_lr, h_lr))
-        lr_image = torch.from_numpy(np.array(lr_image)).permute(2, 0, 1) / 255.0
-        cam.lr = lr_image
-            
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
@@ -78,19 +62,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE 
     depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
-
-    # Load weight maps
-    for cam in scene.getTrainCameras():
-        if args.weight_maps_path is not None:
-            sr_weight_map_lr = torch.load(os.path.join(args.weight_maps_path, "SR_" + cam.image_name + ".pty")).cuda()
-            cam.sr_weight_map = torch.nn.functional.interpolate(sr_weight_map_lr.unsqueeze(0).unsqueeze(0), (cam.image_height, cam.image_width))[0][0]
-        else:
-            if args.no_sr:
-                print("Using SR of all zeros")
-                cam.sr_weight_map = torch.zeros((cam.image_height, cam.image_width), device="cuda")
-            elif args.full_sr:
-                print("Using SR of all ones")
-                cam.sr_weight_map = torch.ones((cam.image_height, cam.image_width), device="cuda")
 
     viewpoint_stack = scene.getTrainCameras().copy()
     viewpoint_indices = list(range(len(viewpoint_stack)))
@@ -145,17 +116,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             image *= alpha_mask
 
         # Loss
-        gt_sr = viewpoint_cam.original_image.cuda()
-        lr_h, lr_w = viewpoint_cam.lr.shape[1:]
-        render_lr = torch.nn.functional.interpolate(image.unsqueeze(0), (lr_h, lr_w), mode='bicubic', antialias=True, align_corners=False).squeeze(0)
-
-        Ll1_sr = (torch.abs((image - gt_sr))*viewpoint_cam.sr_weight_map.unsqueeze(0)).mean()
-        Ll1_lr = (torch.abs(render_lr - viewpoint_cam.lr.cuda())).mean() # Use full LR image
-        Ll1 = args.gamma*Ll1_sr + (1-args.gamma)*Ll1_lr
-        
-        ssim_val_sr = weighted_ssim(image, gt_sr, viewpoint_cam.sr_weight_map)
-        ssim_val_lr = ssim(render_lr, viewpoint_cam.lr.cuda()) # Use full LR image
-        ssim_value = args.gamma*ssim_val_sr + (1-args.gamma)*ssim_val_lr
+        gt_image = viewpoint_cam.original_image.cuda()
+        Ll1 = l1_loss(image, gt_image)
+        if FUSED_SSIM_AVAILABLE:
+            ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+        else:
+            ssim_value = ssim(image, gt_image)
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
@@ -178,13 +144,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         iter_end.record()
 
         with torch.no_grad():
-            if iteration % 1000 == 0 and args.render_debug:
-                save_image([image.cpu(), viewpoint_cam.sr_weight_map.cpu().unsqueeze(0).repeat(3, 1, 1), gt_sr.cpu()], os.path.join(scene.model_path, 'renders', f'iter_{iteration}.jpg'))
-                save_image([render_lr.cpu(), viewpoint_cam.lr.cpu()], os.path.join(scene.model_path, 'renders', f'iter_{iteration}_lr.jpg'))
-                print(f"Iteration {iteration}")
-                print(f"Image: {viewpoint_cam.image_name}")
-                print("Loss: LR L1 {}, SR L1 {}, LR SSIM {}, SR SSIM {}".format(Ll1_lr.item(), Ll1_sr.item(), ssim_val_lr.item(), ssim_val_sr.item()))
-                print(f"Iteration {iteration} == Total Loss: {Ll1} + {ssim_value} => {loss}")
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
@@ -195,7 +154,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration == opt.iterations:
                 progress_bar.close()
 
-            # Save model
+            # Log and save
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -251,6 +211,45 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp):
+    if tb_writer:
+        tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
+        tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
+        tb_writer.add_scalar('iter_time', elapsed, iteration)
+
+    # Report test and samples of training set
+    if iteration in testing_iterations:
+        torch.cuda.empty_cache()
+        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
+                              {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
+
+        for config in validation_configs:
+            if config['cameras'] and len(config['cameras']) > 0:
+                l1_test = 0.0
+                psnr_test = 0.0
+                for idx, viewpoint in enumerate(config['cameras']):
+                    image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
+                    gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+                    if train_test_exp:
+                        image = image[..., image.shape[-1] // 2:]
+                        gt_image = gt_image[..., gt_image.shape[-1] // 2:]
+                    if tb_writer and (idx < 5):
+                        tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
+                        if iteration == testing_iterations[0]:
+                            tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
+                    l1_test += l1_loss(image, gt_image).mean().double()
+                    psnr_test += psnr(image, gt_image).mean().double()
+                psnr_test /= len(config['cameras'])
+                l1_test /= len(config['cameras'])          
+                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
+                if tb_writer:
+                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
+                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
+
+        if tb_writer:
+            tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
+            tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
+        torch.cuda.empty_cache()
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -269,12 +268,6 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--img_ext", type=str, default = None)
-    parser.add_argument("--weight_maps_path", type=str, default = None)
-    parser.add_argument("--gamma", type=float, default = 0.4)
-    parser.add_argument("--render_debug", action='store_true', default=False)
-    parser.add_argument("--upscale", type=int, default = 4)
-    parser.add_argument("--no_sr", action='store_true', default=False)
-    parser.add_argument("--full_sr", action='store_true', default=False)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -287,7 +280,9 @@ if __name__ == "__main__":
     if not args.disable_viewer:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    dataset = lp.extract(args)
+    dataset.img_ext = args.img_ext
+    training(dataset, op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
 
     # All done
     print("\nTraining complete.")

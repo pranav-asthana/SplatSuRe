@@ -20,7 +20,7 @@ class Camera(nn.Module):
     def __init__(self, resolution, colmap_id, R, T, FoVx, FoVy, depth_params, image, invdepthmap,
                  image_name, uid,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda",
-                 train_test_exp = False, is_test_dataset = False, is_test_view = False
+                 train_test_exp = False, is_test_dataset = False, is_test_view = False, upscale=None
                  ):
         super(Camera, self).__init__()
 
@@ -40,6 +40,10 @@ class Camera(nn.Module):
             self.data_device = torch.device("cuda")
 
         resized_image_rgb = PILtoTorch(image, resolution)
+        if upscale is not None:
+            print(f"Loading HR version at {(resolution[0]*upscale, resolution[1]*upscale)}")
+            image_gt_hr = PILtoTorch(image, (resolution[0]*upscale, resolution[1]*upscale))[:3, ...].clamp(0.0, 1.0)
+            self.hr_image = image_gt_hr
         gt_image = resized_image_rgb[:3, ...]
         self.alpha_mask = None
         if resized_image_rgb.shape[0] == 4:

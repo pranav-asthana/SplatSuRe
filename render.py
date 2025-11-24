@@ -48,10 +48,19 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, separate_sh: bool):
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree)
-        scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
+        try:
+            scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False, upscale=(None, dataset.upscale), skip_train=True)
+        except:
+            dataset.img_ext = dataset.img_ext.upper()
+            scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False, upscale=(None, dataset.upscale), skip_train=True)
 
         bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+
+        for cam in scene.getTestCameras():
+            cam.image_height = cam.image_height * dataset.upscale
+            cam.image_width = cam.image_width * dataset.upscale
+            cam.original_image = cam.hr_image.to(cam.data_device)
 
         if not skip_train:
              render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, dataset.train_test_exp, separate_sh)
@@ -68,10 +77,17 @@ if __name__ == "__main__":
     parser.add_argument("--skip_train", action="store_true")
     parser.add_argument("--skip_test", action="store_true")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--img_ext", type=str, default = 'jpg')
+    parser.add_argument("--upscale", type=int, default = 4)
     args = get_combined_args(parser)
     print("Rendering " + args.model_path)
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
 
-    render_sets(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test, SPARSE_ADAM_AVAILABLE)
+    dataset = model.extract(args)
+
+    dataset.img_ext = args.img_ext
+    dataset.upscale = args.upscale
+
+    render_sets(dataset, args.iteration, pipeline.extract(args), args.skip_train, args.skip_test, SPARSE_ADAM_AVAILABLE)

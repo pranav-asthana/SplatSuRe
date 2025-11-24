@@ -20,6 +20,7 @@ import json
 from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser
+from torchmetrics.image.fid import FrechetInceptionDistance
 
 def readImages(renders_dir, gt_dir):
     renders = []
@@ -78,9 +79,30 @@ def evaluate(model_paths):
                 print("  LPIPS: {:>12.7f}".format(torch.tensor(lpipss).mean(), ".5"))
                 print("")
 
+                # Handle variable image sizes in dataset 
+                sizes = list(set([(r.shape[-2], r.shape[-1]) for r in renders]))
+                all_as = []
+                all_bs = []
+                for size in sizes:
+                    print("  Size:", size)
+                    a = [gts[idx][:, :, :size[0], :size[1]] for idx in range(len(gts)) if renders[idx].shape[-2]==size[0] and renders[idx].shape[-1]==size[1]]
+                    b = [renders[idx][:, :, :size[0], :size[1]] for idx in range(len(renders)) if renders[idx].shape[-2]==size[0] and renders[idx].shape[-1]==size[1]]
+                    a = (torch.cat(a)*255).to(torch.uint8)
+                    b = (torch.cat(b)*255).to(torch.uint8)
+                    all_as.append(a)
+                    all_bs.append(b)
+                
+                print("Evaluating FID...")
+                fid_metric = FrechetInceptionDistance().cuda()
+                for a, b in zip(all_as, all_bs):
+                    fid_metric.update(a, real=True)
+                    fid_metric.update(b, real=False)
+                fid_value = fid_metric.compute()
+
                 full_dict[scene_dir][method].update({"SSIM": torch.tensor(ssims).mean().item(),
                                                         "PSNR": torch.tensor(psnrs).mean().item(),
-                                                        "LPIPS": torch.tensor(lpipss).mean().item()})
+                                                        "LPIPS": torch.tensor(lpipss).mean().item(),
+                                                        "FID": fid_value.item()})
                 per_view_dict[scene_dir][method].update({"SSIM": {name: ssim for ssim, name in zip(torch.tensor(ssims).tolist(), image_names)},
                                                             "PSNR": {name: psnr for psnr, name in zip(torch.tensor(psnrs).tolist(), image_names)},
                                                             "LPIPS": {name: lp for lp, name in zip(torch.tensor(lpipss).tolist(), image_names)}})
@@ -89,8 +111,9 @@ def evaluate(model_paths):
                 json.dump(full_dict[scene_dir], fp, indent=True)
             with open(scene_dir + "/per_view.json", 'w') as fp:
                 json.dump(per_view_dict[scene_dir], fp, indent=True)
-        except:
+        except Exception as e:
             print("Unable to compute metrics for model", scene_dir)
+            print(e)
 
 if __name__ == "__main__":
     device = torch.device("cuda:0")
