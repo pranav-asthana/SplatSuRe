@@ -1,0 +1,6 @@
+plyfile
+opencv-python
+requests
+timm
+matplotlib
+tqdm

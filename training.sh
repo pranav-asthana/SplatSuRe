@@ -21,24 +21,21 @@ if [[ $scene = @(drjohnson|playroom) ]]; then
   r=4
 fi
 
-source ~/.bashrc;
+sr_images_dir=images_${r}_${upscale}x
+conda activate splatsure;
 
 # Train LR model
-conda activate gaussian_splatting;
 python train_lr.py -s ${data_dir} -m ${output_dir}/lr/${scene} -r ${r} --eval
-
-conda activate mine_3dgs;
 
 # Get weight masks
 python weight_masks.py -s ${data_dir} -m ${output_dir}/lr/${scene} -r ${r} --eval --img_ext png --weight_maps_dirname ${weight_maps_dirname} --ratio_threshold ${ratio_threshold}
 
-
-# # Train SR model
-python train.py -s ${data_dir} -m ${output_dir}/${scene} -r 1 --eval --images images_${r}_${upscale}x --img_ext png --upscale ${upscale} --weight_maps_path ${output_dir}/lr/${scene}/${weight_maps_dirname}
+# Train SR model
+python train.py -s ${data_dir} -m ${output_dir}/${scene} -r 1 --eval --images ${sr_images_dir} --img_ext png --upscale ${upscale} --weight_maps_path ${output_dir}/lr/${scene}/${weight_maps_dirname}
 
 python render.py --model_path ${output_dir}/${scene} --skip_train --images images -r ${r} --img_ext jpg --upscale ${upscale}
 
-# # Metrics
+# Metrics
 python metrics.py -m ${output_dir}/${scene}
 python cmmd-pytorch/main.py ${output_dir}/${scene}/test/ours_30000/renders ${output_dir}/${scene}/test/ours_30000/gt > ${output_dir}/${scene}/cmmd.txt
 python eval_dreamsim.py -m ${output_dir}/${scene} > ${output_dir}/${scene}/dreamsim.txt

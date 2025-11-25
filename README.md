@@ -613,3 +613,35 @@ pip install submodules\simple-knn
 - *Wait, but ```<insert feature>``` isn't optimized and could be much better?* There are several parts we didn't even have time to think about improving (yet). The performance you get with this prototype is probably a rather slow baseline for what is physically possible.
 
 - *Something is broken, how did this happen?* We tried hard to provide a solid and comprehensible basis to make use of the paper's method. We have refactored the code quite a bit, but we have limited capacity to test all possible usage scenarios. Thus, if part of the website, the code or the performance is lacking, please create an issue. If we find the time, we will do our best to address it.
+
+
+
+# SplatSuRe setup
+```
+# Goto compute node (this is only for my testing on nexus)
+module load cuda/11.8.0
+module load gcc/11.2.0
+conda env remove --name splatsure
+
+git clone git@github.com:pranav-asthana/SplatSuRe.git --recursive
+
+conda create --name splatsure python=3.11
+conda activate splatsure
+conda install -c "nvidia/label/cuda-11.8.0" cuda
+pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cu118
+
+pip install submodules/*
+
+pip install -r requirements.txt
+
+
+
+# Pull other dependencies for metrics (Optional)
+pip install dreamsim pyiqa torchmetrics
+git clone CMMD
+
+```
+
+After setup, store data directories similar to COLMAP format used in 3DGS
+
+Run SISR and store images in image_${DOWNSAMPLE}_${UPSAMPLE}x alongside images.
