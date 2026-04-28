@@ -209,8 +209,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 rgb_resized = F.interpolate(rgb_p.unsqueeze(0), size=(518, 518), mode='bilinear', align_corners=False)
                 da_input = normalize_transform(rgb_resized)
                 
-                mono_inv_p_518 = da_v2_model(da_input).predicted_depth # [1, 518, 518]
-                mono_inv_p = F.interpolate(mono_inv_p_518.unsqueeze(1), size=(H, W), mode='bilinear', align_corners=False).squeeze()
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    mono_inv_p_518 = da_v2_model(da_input).predicted_depth # [1, 518, 518]
+                mono_inv_p = F.interpolate(mono_inv_p_518.unsqueeze(1).float(), size=(H, W), mode='bilinear', align_corners=False).squeeze()
             
             # 4. Pearson Correlation Loss
             # FIXED: Both p_pkg["depth"] and mono_inv_p are inverse depth. Do not invert.
@@ -229,9 +230,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
 
-            if iteration % 10 == 0:
+            if iteration % 100 == 0:
                 progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"})
-                progress_bar.update(10)
+                progress_bar.update(100)
             if iteration == opt.iterations:
                 progress_bar.close()
 
