@@ -1,37 +1,83 @@
 #!/bin/bash
 
-set -e
+set -euo pipefail
 
-scene='Train'
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "${SCRIPT_DIR}"
+
+scene='toy'
 upscale=4
 ratio_threshold=1.1
-weight_maps_dirname=weight_maps
-output_dir=outputs_${upscale}x
-sr_images_dir=images_SR
+r=4
 
-if [[ $scene = @(Auditorium|Ignatius|Palace|Ballroom|Courthouse|Panther|Barn|Lighthouse|Playground|Courtroom|M60|Temple|Caterpillar|Family|Meetingroom|Train|Francis|Truck|Church|Horse|Museum) ]]; then
-  data_dir=data/tandt/${scene}
-  r=8
+dataset_root="${DATASET_ROOT:-${SCRIPT_DIR}/dataset}"
+if [ ! -d "${dataset_root}" ] && [ -d "${SCRIPT_DIR}/../dataset" ]; then
+	dataset_root="${SCRIPT_DIR}/../dataset"
 fi
-if [[ $scene = @(bicycle|bonsai|counter|flowers|garden|kitchen|room|stump|treehill) ]]; then
-  data_dir=data/mipnerf_data/${scene}
-  r=8
+data_dir="${dataset_root}/${scene}"
+sr_images_dirname="images_4x"
+weight_maps_dirname="weight_maps"
+output_dir="outputs_${upscale}x"
+
+if [ ! -d "${data_dir}" ]; then
+	echo "Dataset path not found: ${data_dir}" >&2
+	exit 1
 fi
-if [[ $scene = @(drjohnson|playroom) ]]; then
-  data_dir=data/deep_blending/${scene}/colmap
-  r=4
+
+if [ ! -d "${data_dir}/images" ]; then
+	echo "Missing LR images directory: ${data_dir}/images" >&2
+	exit 1
 fi
+
+if [ ! -d "${data_dir}/${sr_images_dirname}" ]; then
+	if [ -d "${data_dir}/images_SR" ]; then
+		sr_images_dirname="images_SR"
+	else
+		echo "Missing SR images directory: ${data_dir}/images_4x (or images_SR)" >&2
+		exit 1
+	fi
+fi
+
+if ! python -c "import torch" >/dev/null 2>&1; then
+	echo "PyTorch is not installed in the current Python environment." >&2
+	echo "Activate your env first (e.g., conda activate splatsure)." >&2
+	exit 1
+fi
+
+get_ext() {
+	local folder="$1"
+	local first_file
+	first_file="$(find "$folder" -maxdepth 1 -type f | head -n 1)"
+	if [ -z "$first_file" ]; then
+		echo ""
+		return
+	fi
+	basename "$first_file" | awk -F. 'NF>1 {print $NF}'
+}
+
+sr_img_ext="$(get_ext "${data_dir}/${sr_images_dirname}")"
+lr_img_ext="$(get_ext "${data_dir}/images")"
+
+if [ -z "${sr_img_ext}" ] || [ -z "${lr_img_ext}" ]; then
+	echo "Could not infer image extensions from ${data_dir}/images and ${data_dir}/${sr_images_dirname}" >&2
+	exit 1
+fi
+
+lr_model_path="${output_dir}/lr/${scene}"
+sr_model_path="${output_dir}/${scene}"
+weight_maps_path="${lr_model_path}/${weight_maps_dirname}"
 
 # Train LR model
-python train_lr.py -s ${data_dir} -m ${output_dir}/lr/${scene} -r ${r} --eval
+python train_lr.py -s "${data_dir}" -m "${lr_model_path}" -r "${r}" --eval
 
 # Get weight maps
-python weight_maps.py -s ${data_dir} -m ${output_dir}/lr/${scene} -r ${r} --eval --weight_maps_dirname ${weight_maps_dirname} --ratio_threshold ${ratio_threshold}
+python weight_maps.py -s "${data_dir}" -m "${lr_model_path}" -r "${r}" --eval --weight_maps_dirname "${weight_maps_dirname}" --ratio_threshold "${ratio_threshold}"
 
 # Train SR model
-python train.py -s ${data_dir} -m ${output_dir}/${scene} -r 1 --eval --images ${sr_images_dir} --img_ext png --upscale ${upscale} --weight_maps_path ${output_dir}/lr/${scene}/${weight_maps_dirname}
+python train.py -s "${data_dir}" -m "${sr_model_path}" -r 1 --eval --images "${sr_images_dirname}" --img_ext "${sr_img_ext}" --upscale "${upscale}" --weight_maps_path "${weight_maps_path}"
 
-python render.py --model_path ${output_dir}/${scene} --skip_train --images images -r ${r} --img_ext jpg --upscale ${upscale}
-
+# Render
+python render.py --model_path "outputs_4x/toy" --skip_train --images "images" -r 4 --img_ext "${lr_img_ext}" --upscale 4
+# removing skip train does not work properly
 # Metrics
-python metrics.py -m ${output_dir}/${scene}
+python metrics.py -m "${sr_model_path}"

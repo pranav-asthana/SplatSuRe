@@ -11,6 +11,9 @@
 
 import os
 import torch
+import torch.nn.functional as F
+import json
+
 from random import randint
 from utils.loss_utils import ssim, weighted_ssim
 from gaussian_renderer import render, network_gui
@@ -54,6 +57,34 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
+
+    # ===================================================================
+    # FLOAT32 DEPTH INJECTION - LOAD CACHE
+    # ===================================================================
+
+    depth_cache = {}
+    depth_json_path = os.path.join(dataset.source_path, "sparse", "0", "depth_params.json")
+    depth_npy_dir = os.path.join(dataset.source_path, "depths_npy")
+    
+    if os.path.exists(depth_json_path):
+        with open(depth_json_path, 'r') as f:
+            depth_params = json.load(f)
+        
+        print(f"\nLoading high-precision depth maps from {depth_npy_dir}...")
+        for cam in scene.getTrainCameras():
+            stem = os.path.splitext(cam.image_name)[0]
+            if stem in depth_params:
+                params = depth_params[stem]
+                # THE FIX: Scale-Invariant Reliability Check
+                if params['n_inliers'] >= 8 and params['pearson'] > 0.3:
+                    npy_path = os.path.join(depth_npy_dir, f"{stem}.npy")
+                    if os.path.exists(npy_path):
+                        raw_depth = np.load(npy_path)
+                        # Apply alignment perfectly in pure float32
+                        aligned = params['scale'] * raw_depth + params['offset']
+                        depth_cache[cam.uid] = torch.from_numpy(aligned).cuda()
+        print(f"Successfully loaded {len(depth_cache)} reliable float32 depth maps.\n")
+    # ===================================================================
     if args.render_debug:
         os.makedirs(os.path.join(scene.model_path, 'renders'), exist_ok=True)
     gaussians.training_setup(opt)
@@ -69,7 +100,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         cam.lr = lr_image
             
     if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint)
+        (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
         gaussians.restore(model_params, opt)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
@@ -82,10 +113,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
 
     # Load weight maps
+# Load weight maps
     for cam in scene.getTrainCameras():
         if args.weight_maps_path is not None:
-            sr_weight_map_lr = torch.load(os.path.join(args.weight_maps_path, "SR_" + cam.image_name + ".pty")).cuda()
-            cam.sr_weight_map = torch.nn.functional.interpolate(sr_weight_map_lr.unsqueeze(0).unsqueeze(0), (cam.image_height, cam.image_width))[0][0]
+            stem = os.path.splitext(cam.image_name)[0]
+            sr_weight_map_lr = torch.load(
+                os.path.join(args.weight_maps_path, f"SR_{stem}.pty"), weights_only=False
+            ).cuda()
+            cam.sr_weight_map = torch.nn.functional.interpolate(
+                sr_weight_map_lr.unsqueeze(0).unsqueeze(0),
+                (cam.image_height, cam.image_width),
+                mode='bilinear',
+                align_corners=False,
+            )[0][0]
         else:
             if args.no_sr:
                 print("Using SR of all zeros")
@@ -149,7 +189,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Loss
         gt_sr = viewpoint_cam.original_image.cuda()
         lr_h, lr_w = viewpoint_cam.lr.shape[1:]
-        render_lr = torch.nn.functional.interpolate(image.unsqueeze(0), (lr_h, lr_w), mode='bicubic', antialias=True, align_corners=False).squeeze(0)
+        render_lr = torch.nn.functional.interpolate(image.unsqueeze(0), (lr_h, lr_w), mode='area').squeeze(0)
 
         Ll1_sr = (torch.abs((image - gt_sr))*viewpoint_cam.sr_weight_map.unsqueeze(0)).mean()
         Ll1_lr = (torch.abs(render_lr - viewpoint_cam.lr.cuda())).mean() # Use full LR image
@@ -162,18 +202,43 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
         # Depth regularization
-        Ll1depth_pure = 0.0
-        if depth_l1_weight(iteration) > 0 and viewpoint_cam.depth_reliable:
-            invDepth = render_pkg["depth"]
-            mono_invdepth = viewpoint_cam.invdepthmap.cuda()
-            depth_mask = viewpoint_cam.depth_mask.cuda()
-
-            Ll1depth_pure = torch.abs((invDepth  - mono_invdepth) * depth_mask).mean()
-            Ll1depth = depth_l1_weight(iteration) * Ll1depth_pure 
-            loss += Ll1depth
-            Ll1depth = Ll1depth.item()
-        else:
-            Ll1depth = 0
+        # ===================================================================
+        # FLOAT32 DEPTH LOSS CALCULATION
+        # ===================================================================
+        # FLOAT32 DEPTH LOSS CALCULATION
+        depth_weight_current = depth_l1_weight(iteration) 
+        Ll1depth = 0.0 
+        
+        if depth_weight_current > 0 and viewpoint_cam.uid in depth_cache:
+            invDepth_pred = render_pkg["depth"] 
+            mono_target = depth_cache[viewpoint_cam.uid] 
+            
+            if invDepth_pred.shape[1:] != mono_target.shape:
+                mono_target_rs = F.interpolate(mono_target.unsqueeze(0).unsqueeze(0), size=invDepth_pred.shape[1:], mode='bilinear')[0, 0]
+            else:
+                mono_target_rs = mono_target
+            
+            loss_depth = torch.abs(invDepth_pred.squeeze() - mono_target_rs).mean()
+            loss += depth_weight_current * loss_depth
+            Ll1depth = (depth_weight_current * loss_depth).item()
+        
+        # if viewpoint_cam.uid in depth_cache:
+        #     invDepth_pred = render_pkg["depth"] # Usually [1, H, W]
+        #     mono_target = depth_cache[viewpoint_cam.uid] # [H, W]
+            
+        #     # Match dimensions if resolution changed
+        #     if invDepth_pred.shape[1:] != mono_target.shape:
+        #         mono_target_rs = F.interpolate(mono_target.unsqueeze(0).unsqueeze(0), size=invDepth_pred.shape[1:], mode='bilinear')[0, 0]
+        #     else:
+        #         mono_target_rs = mono_target
+            
+        #     # Calculate L1 distance between aligned DA-V2 and 3DGS depth
+        #     loss_depth = torch.abs(invDepth_pred.squeeze() - mono_target_rs).mean()
+            
+        #     # Apply depth regularization
+        #     loss += depth_weight * loss_depth
+        #     Ll1depth = (depth_weight * loss_depth).item() # Update for logging
+        # ===================================================================
 
         loss.backward()
 
@@ -209,8 +274,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
+                    size_threshold = 5 if iteration > opt.opacity_reset_interval else None
+                    # Gate the pruning threshold based on whether depth supervision is active for this scene
+                    # prune_opacity = 0.005 if opt.depth_l1_weight_init > 0 else 0.05
+                    # Remove the conditional entirely
+                    prune_opacity = 0.005
+                    gaussians.densify_and_prune(opt.densify_grad_threshold, prune_opacity, scene.cameras_extent, size_threshold, radii)
+                    #aussians.densify_and_prune(opt.densify_grad_threshold, 0.05, scene.cameras_extent, size_threshold, radii)
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()

@@ -23,6 +23,13 @@ parser.add_argument("--weight_maps_dirname", type=str, default = "weight_maps")
 parser.add_argument("--ratio_threshold", type=float, default = 1.7)
 parser.add_argument("--render_debug", action="store_true", default=False)
 
+#dummy args:
+parser.add_argument("--pseudo_view_weight", type=float, default=0.0)
+parser.add_argument("--pseudo_view_interval", type=int, default=10)
+parser.add_argument("--pseudo_view_start", type=int, default=2000)
+parser.add_argument("--pseudo_view_end", type=int, default=10000) # ADD THIS LINE
+parser.add_argument("--pseudo_view_model_size", type=str, default="small", choices=["small", "base", "large"])
+
 args = parser.parse_args(sys.argv[1:])
 
 print("Optimizing " + args.model_path)
@@ -99,4 +106,5 @@ with torch.no_grad():
             render_pkg = render(cam, gaussians, pipe, background, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
             rendering = render_pkg['render'].cpu()
             save_image([image_good, image_good_curr, one_m_good, sr_map.unsqueeze(0).repeat(3, 1, 1), rendering], f'{args.weight_maps_path}/importance_{img_idx}.jpg', pad_value=1)
-        torch.save(sr_map, f'{args.weight_maps_path}/SR_{cam.image_name}.pty')
+        stem = os.path.splitext(cam.image_name)[0]
+        torch.save(sr_map, os.path.join(args.weight_maps_path, f'SR_{stem}.pty'))

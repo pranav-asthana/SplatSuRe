@@ -8,7 +8,11 @@
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
-
+import copy
+import numpy as np
+import torch.nn.functional as F
+import torchvision.transforms as T
+from transformers import AutoModelForDepthEstimation
 import os
 import torch
 from random import randint
@@ -40,7 +44,37 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+def pearson_corr_loss(pred_depth, mono_depth):
+    # Flatten and normalize
+    pred_depth = pred_depth.flatten()
+    mono_depth = mono_depth.flatten()
+    pred_depth = (pred_depth - pred_depth.mean()) / (pred_depth.std() + 1e-6)
+    mono_depth = (mono_depth - mono_depth.mean()) / (mono_depth.std() + 1e-6)
+    # 1.0 - mean(a * b) minimizes to 0 when perfectly positively correlated
+    return 1.0 - (pred_depth * mono_depth).mean()
+
+def interpolate_pseudo_camera(cam_a, cam_b, t):
+    from utils.graphics_utils import getWorld2View2
+    # SLERP Rotation via SVD
+    R_lerp = (1 - t) * cam_a.R + t * cam_b.R
+    U, _, Vt = np.linalg.svd(R_lerp)
+    R = U @ Vt
+    if np.linalg.det(R) < 0:
+        Vt[-1] *= -1
+        R = U @ Vt
+    # LERP Translation
+    T = (1 - t) * cam_a.T + t * cam_b.T
+    
+    # Clone camera properties safely
+    p = copy.copy(cam_a)
+    p.R = R
+    p.T = T
+    p.world_view_transform = torch.tensor(getWorld2View2(R, T, cam_a.trans, cam_a.scale)).transpose(0, 1).cuda()
+    p.full_proj_transform = (p.world_view_transform.unsqueeze(0).bmm(cam_a.projection_matrix.unsqueeze(0))).squeeze(0)
+    p.camera_center = p.world_view_transform.inverse()[3, :3]
+    return p
+
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, args):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
@@ -49,9 +83,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
+    # ── Pure GPU DA-V2 Initialization ──
+    da_v2_model = None
+    normalize_transform = None
+    if args.pseudo_view_weight > 0:
+        model_id = f"depth-anything/Depth-Anything-V2-{args.pseudo_view_model_size.capitalize()}-hf"
+        print(f"[FSGS] Loading {model_id} for Pseudo-View Regularization...")
+        da_v2_model = AutoModelForDepthEstimation.from_pretrained(model_id).to("cuda").eval()
+        for p in da_v2_model.parameters(): 
+            p.requires_grad_(False)
+        # Standard ImageNet normalization required by DA-V2 Transformers
+        normalize_transform = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+
+    train_cams_sorted = sorted(scene.getTrainCameras(), key=lambda c: c.image_name)
+
     gaussians.training_setup(opt)
     if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint)
+        (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
         gaussians.restore(model_params, opt)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
@@ -138,6 +186,39 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             Ll1depth = Ll1depth.item()
         else:
             Ll1depth = 0
+
+        # ===================================================================
+        # FSGS: Pseudo-View Depth Regularization 
+        # ===================================================================
+        if (da_v2_model is not None 
+            and args.pseudo_view_start < iteration < args.pseudo_view_end # Corrected bounds
+            and iteration % args.pseudo_view_interval == 0):
+            
+            # 1. Sample interpolation
+            i = randint(0, len(train_cams_sorted) - 2)
+            t = 0.3 + 0.4 * torch.rand(1).item() # Keep it between 0.3 and 0.7
+            p_cam = interpolate_pseudo_camera(train_cams_sorted[i], train_cams_sorted[i + 1], t)
+            
+            # 2. Render Virtual View
+            p_pkg = render(p_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
+            rgb_p = p_pkg["render"].clamp(0, 1)
+            
+            # 3. Pure-GPU DA-V2 Inference
+            with torch.no_grad():
+                H, W = rgb_p.shape[1:]
+                rgb_resized = F.interpolate(rgb_p.unsqueeze(0), size=(518, 518), mode='bilinear', align_corners=False)
+                da_input = normalize_transform(rgb_resized)
+                
+                mono_inv_p_518 = da_v2_model(da_input).predicted_depth # [1, 518, 518]
+                mono_inv_p = F.interpolate(mono_inv_p_518.unsqueeze(1), size=(H, W), mode='bilinear', align_corners=False).squeeze()
+            
+            # 4. Pearson Correlation Loss
+            # FIXED: Both p_pkg["depth"] and mono_inv_p are inverse depth. Do not invert.
+            inv_d_p = p_pkg["depth"].squeeze() 
+            loss_pseudo = args.pseudo_view_weight * pearson_corr_loss(inv_d_p, mono_inv_p)
+            loss += loss_pseudo
+        # ===================================================================
+
 
         loss.backward()
 
@@ -268,6 +349,13 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--img_ext", type=str, default = None)
+    ## 
+# In train_lr.py __main__ argument parser:
+    parser.add_argument("--pseudo_view_weight", type=float, default=0.0)
+    parser.add_argument("--pseudo_view_interval", type=int, default=10)
+    parser.add_argument("--pseudo_view_start", type=int, default=2000)
+    parser.add_argument("--pseudo_view_end", type=int, default=10000) # ADD THIS LINE
+    parser.add_argument("--pseudo_view_model_size", type=str, default="small", choices=["small", "base", "large"])
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -282,7 +370,7 @@ if __name__ == "__main__":
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     dataset = lp.extract(args)
     dataset.img_ext = args.img_ext
-    training(dataset, op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
-
+   #training(dataset, op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args)
+    training(dataset, op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args)
     # All done
     print("\nTraining complete.")
