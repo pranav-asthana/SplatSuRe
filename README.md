@@ -1,4 +1,4 @@
-# SplatSuRe: Selective Super-Resolution for Multi-view Consistent 3D Gaussian Splatting
+# SplatSuRe: Selective Super-Resolution for Multi-view Consistent 3D Gaussian Splatting (CVPR 2026)
 [Pranav Asthana](https://pranav-asthana.github.io/), [Alex Hanson](https://www.cs.umd.edu/~hanson/), [Allen Tu](https://tuallen.github.io/), [Tom Goldstein](https://www.cs.umd.edu/~tomg/), [Matthias Zwicker](https://www.cs.umd.edu/~zwicker/), [Amitabh Varshney](https://www.cs.umd.edu/~varshney/)<br>
 University of Maryland, College Park<br>
 [Webpage](https://splatsure.github.io) | [arXiv](https://arxiv.org/abs/2512.02172) | [StableSR outputs(T&T, DB, MipNerf360)](https://drive.google.com/drive/folders/1mhEKcvJtxhPCrsTveRFbEkTSqerJyjvb) | [COLMAP(T&T)](https://drive.google.com/drive/folders/1iNMynWtvRg1N--YyqpB1HaPkt-kURj04)<br>
