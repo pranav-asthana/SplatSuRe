@@ -123,13 +123,16 @@ The metrics are stored in the output directory, with SSIM, PSNR, LPIPS and FID i
 <section class="section" id="BibTeX">
   <div class="container is-max-desktop content">
     <h2 class="title">BibTeX</h2>
-    <pre><code>@article{Asthana2025SplatSuRe,
+    <pre><code>@InProceedings{Asthana2025SplatSuRe,
     author    = {Asthana, Pranav and Hanson, Alex and Tu, Allen and Goldstein, Tom and Zwicker, Matthias and Varshney, Amitabh},
     title     = {SplatSuRe: Selective Super-Resolution for Multi-view Consistent 3D Gaussian Splatting},
-    journal   = {arXiv preprint arXiv:2512.02172},
-    year      = {2025},
+    booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
+    month     = {June},
+    year      = {2026},
+    pages     = {11840-11849},
     url       = {https://splatsure.github.io/}
-}</code></pre>
+}
+</code></pre>
   </div>
 </section>
 
