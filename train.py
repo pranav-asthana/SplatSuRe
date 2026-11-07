@@ -35,13 +35,13 @@ from PIL import Image
 try:
     from fused_ssim import fused_ssim
     FUSED_SSIM_AVAILABLE = True
-except:
+except ImportError:
     FUSED_SSIM_AVAILABLE = False
 
 try:
     from diff_gaussian_rasterization import SparseGaussianAdam
     SPARSE_ADAM_AVAILABLE = True
-except:
+except ImportError:
     SPARSE_ADAM_AVAILABLE = False
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, upscale):
